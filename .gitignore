@@ -1,0 +1,13 @@
+.worktrees/
+.tools/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+dist/
+build/
+reports/
+TestResults/
