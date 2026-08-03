@@ -1,0 +1,106 @@
+parameters:
+  - name: workingDirectory
+    type: string
+    default: "."
+  - name: terraformVersion
+    type: string
+    default: "1.9.7"
+
+stages:
+  - stage: TerraformValidation
+    displayName: Terraform validation
+    jobs:
+      - job: ValidateTerraform
+        displayName: Validate Terraform configuration
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            persistCredentials: false
+
+          - task: TerraformInstaller@1
+            displayName: Install Terraform
+            inputs:
+              terraformVersion: ${{ parameters.terraformVersion }}
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              cd -- "$safe_path"
+              terraform fmt -check -recursive
+            displayName: Check Terraform format
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+              TERRAFORM_VERSION: ${{ parameters.terraformVersion }}
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              cd -- "$safe_path"
+              terraform init -backend=false -input=false
+            displayName: Initialize Terraform without a backend
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+
+          - bash: |
+              set -euo pipefail
+              tflint_version="0.58.1"
+              archive="tflint_linux_amd64.zip"
+              release_url="https://github.com/terraform-linters/tflint/releases/download/v${tflint_version}"
+              download_dir="$(mktemp -d)"
+              install_dir="$AGENT_TEMPDIRECTORY/tflint-$tflint_version"
+              trap 'rm -rf -- "$download_dir"' EXIT
+              mkdir -p -- "$install_dir"
+              curl --fail --location --proto '=https' --tlsv1.2 \
+                --output "$download_dir/$archive" "$release_url/$archive"
+              curl --fail --location --proto '=https' --tlsv1.2 \
+                --output "$download_dir/checksums.txt" "$release_url/checksums.txt"
+              expected_checksum="$(awk -v archive="$archive" '$2 == archive { print $1 }' "$download_dir/checksums.txt")"
+              if [[ ! "$expected_checksum" =~ ^[0-9a-fA-F]{64}$ ]]; then
+                printf 'Unable to obtain the TFLint release checksum\n' >&2
+                exit 2
+              fi
+              printf '%s  %s\n' "$expected_checksum" "$download_dir/$archive" | sha256sum --check --strict
+              unzip -q "$download_dir/$archive" -d "$download_dir/bin"
+              install -m 0755 "$download_dir/bin/tflint" "$install_dir/tflint"
+              printf '##vso[task.prependpath]%s\n' "$install_dir"
+            displayName: Install verified TFLint
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              cd -- "$safe_path"
+              tflint --init
+              tflint --recursive
+            displayName: Lint Terraform configuration
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              cd -- "$safe_path"
+              terraform validate
+            displayName: Validate Terraform configuration
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}

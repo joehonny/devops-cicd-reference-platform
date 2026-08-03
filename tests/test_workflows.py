@@ -39,8 +39,8 @@ PARAMETER_EXPRESSION = re.compile(
     re.IGNORECASE,
 )
 PATH_VARIABLE = re.compile(
-    r"\$(?:(?:env:)?(?:WORKING_DIRECTORY|TEST_PATH)|"
-    r"\{(?:WORKING_DIRECTORY|TEST_PATH)\})",
+    r"\$(?:(?:env:)?(?:WORKING_DIRECTORY|TEST_PATH|DEPENDENCY_FILE)|"
+    r"\{(?:WORKING_DIRECTORY|TEST_PATH|DEPENDENCY_FILE)\})",
     re.IGNORECASE,
 )
 
@@ -208,7 +208,10 @@ def has_canonical_containment(command_text: str, path_name: str) -> bool:
     tail = command_text[canonical.end() :]
     canonical_reference = rf"\$(?:\{{)?{variable}(?:\}})?"
     root_names = "GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY"
-    root_reference = rf"\$(?:(?:env:)?(?:{root_names})|\{{(?:{root_names})\}})"
+    root_reference = (
+        rf"(?:\$(?:(?:env:)?(?:{root_names})|\{{(?:{root_names})\}})|"
+        r"\$(?:\{)?safe_?(?:path|root)(?:\})?)"
+    )
     boundary_patterns = [
         rf"case\s+['\"]?{canonical_reference}['\"]?\s+in"
         rf"[\s\S]{{0,400}}{root_reference}[^\r\n]*/\*",
@@ -559,7 +562,16 @@ def test_reviewed_github_workflow_safety_regressions() -> None:
     [
         ("terraform", {"workingDirectory", "terraformVersion"}),
         ("powershell", {"workingDirectory", "powershellVersion", "testPath"}),
-        ("python", {"workingDirectory", "pythonVersion", "testPath"}),
+        (
+            "python",
+            {
+                "workingDirectory",
+                "pythonVersion",
+                "testPath",
+                "dependencyFile",
+                "installProject",
+            },
+        ),
     ],
 )
 def test_azure_template_parameter_contract(name: str, expected_parameters: set[str]) -> None:
@@ -577,12 +589,19 @@ def test_azure_template_parameter_contract(name: str, expected_parameters: set[s
         f"found {sorted(str(name) for name in by_name)}"
     )
     for parameter_name, parameter in by_name.items():
-        assert parameter.get("type") == "string", (
-            f"{source.as_posix()}: parameter {parameter_name!r} must use type: string"
+        expected_type = "boolean" if parameter_name == "installProject" else "string"
+        assert parameter.get("type") == expected_type, (
+            f"{source.as_posix()}: parameter {parameter_name!r} must use "
+            f"type: {expected_type}"
         )
-        assert str(parameter.get("default", "")).strip(), (
-            f"{source.as_posix()}: parameter {parameter_name!r} needs a safe default"
-        )
+        if parameter_name == "dependencyFile":
+            assert parameter.get("default") == ""
+        elif parameter_name == "installProject":
+            assert parameter.get("default") is False
+        else:
+            assert str(parameter.get("default", "")).strip(), (
+                f"{source.as_posix()}: parameter {parameter_name!r} needs a safe default"
+            )
     assert any(key in template for key in ("stages", "jobs", "steps")), (
         f"{source.as_posix()}: template must expose stages, jobs, or steps"
     )
@@ -656,6 +675,50 @@ def test_azure_example_imports_all_validation_templates() -> None:
         assert template in serialized, (
             f"{source.as_posix()}: example must reference {template}"
         )
+
+
+@pytest.mark.azure
+def test_reviewed_azure_template_safety_regressions() -> None:
+    terraform = load_yaml(AZURE_PIPELINES["terraform"])
+    powershell = load_yaml(AZURE_PIPELINES["powershell"])
+    python = load_yaml(AZURE_PIPELINES["python"])
+
+    terraform_commands = "\n".join(
+        command for _trail, _shell, command in run_blocks(terraform)
+    )
+    assert terraform_commands.find("tflint --init") < terraform_commands.find(
+        "tflint --recursive"
+    )
+
+    powershell_commands = "\n".join(
+        command for _trail, _shell, command in run_blocks(powershell)
+    )
+    assert "Import-PowerShellDataFile" in powershell_commands
+    assert "ModuleVersion" in powershell_commands
+    assert re.search(r"RootModule|NestedModules", powershell_commands)
+    assert "SkipPublisherCheck" not in powershell_commands
+    assert "OrdinalIgnoreCase" not in powershell_commands
+    assert "[StringComparison]::Ordinal" in powershell_commands
+
+    python_commands = "\n".join(
+        command for _trail, _shell, command in run_blocks(python)
+    )
+    assert re.search(
+        r'case\s+"\$safe_dependency_file"\s+in\s*\n\s*"\$safe_path"\|"\$safe_path"/\*',
+        python_commands,
+    )
+    dependency_install = (
+        'python -m pip install --requirement "$safe_dependency_file"'
+    )
+    project_install = 'python -m pip install "$safe_path"'
+    pinned_tools = (
+        "python -m pip install --disable-pip-version-check "
+        "ruff==0.12.11 pytest==8.4.1 PyYAML==6.0.2"
+    )
+    pinned_position = python_commands.find(pinned_tools)
+    assert pinned_position >= 0
+    assert 0 <= python_commands.find(dependency_install) < pinned_position
+    assert 0 <= python_commands.find(project_install) < pinned_position
 
 
 def validation_policy_violations(document: Mapping[str, Any], source: Path) -> list[str]:
@@ -841,7 +904,11 @@ def test_path_parameters_are_passed_via_environment_and_quoted() -> None:
             GITHUB_WORKFLOWS["python"]: {"working-directory"},
             AZURE_PIPELINES["terraform"]: {"working-directory"},
             AZURE_PIPELINES["powershell"]: {"working-directory", "test-path"},
-            AZURE_PIPELINES["python"]: {"working-directory", "test-path"},
+            AZURE_PIPELINES["python"]: {
+                "working-directory",
+                "test-path",
+                "dependency-file",
+            },
         }.get(relative, set())
         if required_paths:
             command_text = "\n".join(commands)

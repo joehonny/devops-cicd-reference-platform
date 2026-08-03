@@ -1,0 +1,121 @@
+parameters:
+  - name: workingDirectory
+    type: string
+    default: "."
+  - name: pythonVersion
+    type: string
+    default: "3.12"
+  - name: testPath
+    type: string
+    default: "tests"
+  - name: dependencyFile
+    type: string
+    default: ""
+  - name: installProject
+    type: boolean
+    default: false
+
+stages:
+  - stage: PythonValidation
+    displayName: Python validation
+    jobs:
+      - job: ValidatePython
+        displayName: Validate Python source and tests
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            persistCredentials: false
+
+          - task: UsePythonVersion@0
+            displayName: Install Python
+            inputs:
+              versionSpec: ${{ parameters.pythonVersion }}
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              if [[ -n "$DEPENDENCY_FILE" ]]; then
+                safe_dependency_file=$(realpath -- "$safe_path/$DEPENDENCY_FILE")
+                case "$safe_dependency_file" in
+                  "$safe_path"|"$safe_path"/*) ;;
+                  *) printf 'Dependency file is outside the working directory\n' >&2; exit 2 ;;
+                esac
+                if [[ ! -f "$safe_dependency_file" ]]; then
+                  printf 'Dependency file does not exist or is not a file\n' >&2
+                  exit 2
+                fi
+                cd -- "$safe_path"
+                python -m pip install --requirement "$safe_dependency_file"
+              fi
+              install_project="$(printf '%s' "$INSTALL_PROJECT" | tr '[:upper:]' '[:lower:]')"
+              case "$install_project" in
+                true)
+                  if [[ ! -f "$safe_path/pyproject.toml" && ! -f "$safe_path/setup.py" ]]; then
+                    printf 'Project installation requested, but no project metadata exists\n' >&2
+                    exit 2
+                  fi
+                  python -m pip install "$safe_path"
+                  ;;
+                false) ;;
+                *) printf 'installProject must be true or false\n' >&2; exit 2 ;;
+              esac
+              python -m pip install --disable-pip-version-check ruff==0.12.11 pytest==8.4.1 PyYAML==6.0.2
+            displayName: Install project dependencies and exact validation tools
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+              DEPENDENCY_FILE: ${{ parameters.dependencyFile }}
+              INSTALL_PROJECT: ${{ parameters.installProject }}
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              cd -- "$safe_path"
+              ruff format --check .
+            displayName: Check Python format
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              cd -- "$safe_path"
+              ruff check .
+            displayName: Lint Python source
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+
+          - bash: |
+              set -euo pipefail
+              safe_root=$(realpath -- "$BUILD_SOURCESDIRECTORY")
+              safe_path=$(realpath -- "$safe_root/$WORKING_DIRECTORY")
+              case "$safe_path" in
+                "$safe_root"|"$safe_root"/*) ;;
+                *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+              esac
+              safe_test_path=$(realpath -- "$safe_path/$TEST_PATH")
+              case "$safe_test_path" in
+                "$safe_path"|"$safe_path"/*) ;;
+                *) printf 'Test path is outside the working directory\n' >&2; exit 2 ;;
+              esac
+              cd -- "$safe_path"
+              pytest "$safe_test_path"
+            displayName: Run Pytest tests
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+              TEST_PATH: ${{ parameters.testPath }}

@@ -1,0 +1,110 @@
+parameters:
+  - name: workingDirectory
+    type: string
+    default: "."
+  - name: powershellVersion
+    type: string
+    default: "7.4"
+  - name: testPath
+    type: string
+    default: "tests"
+
+stages:
+  - stage: PowerShellValidation
+    displayName: PowerShell validation
+    jobs:
+      - job: ValidatePowerShell
+        displayName: Validate PowerShell source and tests
+        pool:
+          vmImage: ubuntu-24.04
+        steps:
+          - checkout: self
+            persistCredentials: false
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $requestedVersion = [version]"$env:POWERSHELL_VERSION"
+              if ($PSVersionTable.PSVersion -lt $requestedVersion) {
+                throw "PowerShell $($PSVersionTable.PSVersion) is older than requested minimum $requestedVersion"
+              }
+              Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+              Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+              Install-Module -Name Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
+            displayName: Install exact PowerShell validation modules
+            env:
+              POWERSHELL_VERSION: ${{ parameters.powershellVersion }}
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $safeRoot = (Resolve-Path -LiteralPath "$env:BUILD_SOURCESDIRECTORY").Path
+              $safePath = (Resolve-Path -LiteralPath (Join-Path "$safeRoot" "$env:WORKING_DIRECTORY")).Path
+              if (-not ($safePath.Equals("$safeRoot", [StringComparison]::Ordinal) -or
+                  $safePath.StartsWith("$safeRoot/", [StringComparison]::Ordinal))) {
+                throw 'Working directory is outside the checkout'
+              }
+              Get-ChildItem -LiteralPath "$safePath" -Recurse -File -Include '*.ps1','*.psm1','*.psd1' | ForEach-Object {
+                $parseErrors = $null
+                [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$parseErrors) | Out-Null
+                if ($parseErrors.Count -gt 0) { throw ($parseErrors -join [Environment]::NewLine) }
+              }
+            displayName: Parse PowerShell source
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $safeRoot = (Resolve-Path -LiteralPath "$env:BUILD_SOURCESDIRECTORY").Path
+              $safePath = (Resolve-Path -LiteralPath (Join-Path "$safeRoot" "$env:WORKING_DIRECTORY")).Path
+              if (-not ($safePath.Equals("$safeRoot", [StringComparison]::Ordinal) -or
+                  $safePath.StartsWith("$safeRoot/", [StringComparison]::Ordinal))) {
+                throw 'Working directory is outside the checkout'
+              }
+              Get-ChildItem -LiteralPath "$safePath" -Recurse -File -Filter '*.psd1' | ForEach-Object {
+                try {
+                  $manifestData = Import-PowerShellDataFile -Path "$($_.FullName)" -ErrorAction Stop
+                } catch {
+                  $manifestData = $null
+                }
+                if ($null -ne $manifestData) {
+                  $hasModuleEntry = -not [string]::IsNullOrWhiteSpace([string]$manifestData.RootModule) -or
+                    @($manifestData.NestedModules).Count -gt 0
+                  if ($manifestData.ContainsKey('ModuleVersion') -and $hasModuleEntry) {
+                    Test-ModuleManifest -Path "$($_.FullName)" -ErrorAction Stop | Out-Null
+                  }
+                }
+              }
+            displayName: Validate PowerShell module manifests
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $safeRoot = (Resolve-Path -LiteralPath "$env:BUILD_SOURCESDIRECTORY").Path
+              $safePath = (Resolve-Path -LiteralPath (Join-Path "$safeRoot" "$env:WORKING_DIRECTORY")).Path
+              if (-not ($safePath.Equals("$safeRoot", [StringComparison]::Ordinal) -or
+                  $safePath.StartsWith("$safeRoot/", [StringComparison]::Ordinal))) {
+                throw 'Working directory is outside the checkout'
+              }
+              Invoke-ScriptAnalyzer -Path "$safePath" -Recurse -Severity Error -EnableExit
+            displayName: Analyze PowerShell source
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $safeRoot = (Resolve-Path -LiteralPath "$env:BUILD_SOURCESDIRECTORY").Path
+              $safePath = (Resolve-Path -LiteralPath (Join-Path "$safeRoot" "$env:WORKING_DIRECTORY")).Path
+              if (-not ($safePath.Equals("$safeRoot", [StringComparison]::Ordinal) -or
+                  $safePath.StartsWith("$safeRoot/", [StringComparison]::Ordinal))) {
+                throw 'Working directory is outside the checkout'
+              }
+              $safeTestPath = (Resolve-Path -LiteralPath (Join-Path "$safePath" "$env:TEST_PATH")).Path
+              if (-not ($safeTestPath.Equals("$safePath", [StringComparison]::Ordinal) -or
+                  $safeTestPath.StartsWith("$safePath/", [StringComparison]::Ordinal))) {
+                throw 'Test path is outside the working directory'
+              }
+              Invoke-Pester -Path "$safeTestPath" -CI
+            displayName: Run Pester tests
+            env:
+              WORKING_DIRECTORY: ${{ parameters.workingDirectory }}
+              TEST_PATH: ${{ parameters.testPath }}

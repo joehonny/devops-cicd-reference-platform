@@ -1,0 +1,22 @@
+trigger: none
+pr: none
+
+stages:
+  - template: ../azure-pipelines/templates/terraform-validate.yml
+    parameters:
+      workingDirectory: examples/terraform
+      terraformVersion: "1.9.7"
+
+  - template: ../azure-pipelines/templates/powershell-test.yml
+    parameters:
+      workingDirectory: examples/powershell
+      powershellVersion: "7.4"
+      testPath: tests
+
+  - template: ../azure-pipelines/templates/python-test.yml
+    parameters:
+      workingDirectory: examples/python
+      pythonVersion: "3.12"
+      testPath: tests
+      dependencyFile: ""
+      installProject: false
