@@ -145,27 +145,84 @@ def occurrence_is_quoted(line: str, start: int) -> bool:
     return single_open or double_open
 
 
+def executable_lines(command_text: str) -> list[str]:
+    """Return command lines, excluding comments and here-document/string payloads."""
+    lines: list[str] = []
+    heredoc_end: str | None = None
+    powershell_here_end: str | None = None
+    block_comment = False
+    for raw_line in command_text.splitlines():
+        stripped = raw_line.strip()
+        if heredoc_end is not None:
+            if stripped == heredoc_end:
+                heredoc_end = None
+            continue
+        if powershell_here_end is not None:
+            if stripped == powershell_here_end:
+                powershell_here_end = None
+            continue
+        if block_comment:
+            if "#>" in stripped:
+                block_comment = False
+            continue
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("<#"):
+            block_comment = "#>" not in stripped
+            continue
+        here_string = re.search(r"@(['\"])\s*$", stripped)
+        if here_string:
+            powershell_here_end = f"{here_string.group(1)}@"
+        heredoc = re.search(r"<<-?\s*['\"]?([A-Za-z_][\w-]*)['\"]?\s*$", stripped)
+        if heredoc:
+            heredoc_end = heredoc.group(1)
+        lines.append(stripped)
+    return lines
+
+
+def has_executable_invocation(command_text: str, pattern: str) -> bool:
+    return any(re.search(pattern, line, re.IGNORECASE) for line in executable_lines(command_text))
+
+
 def has_canonical_containment(command_text: str, path_name: str) -> bool:
-    """Require path canonicalization followed by a checkout-boundary comparison."""
+    """Require a canonical-path variable in a later checkout-boundary comparison."""
     shell_name = path_name.replace("-", "_").upper()
-    canonical = re.search(
-        rf"(?:realpath|Resolve-Path|GetFullPath)[^\r\n]*{re.escape(shell_name)}",
-        command_text,
-        re.IGNORECASE,
+    canonical_patterns = [
+        re.compile(
+            rf"(?m)^\s*(?P<variable>[A-Za-z_]\w*)\s*=\s*['\"]?\$\(\s*"
+            rf"realpath\b[^\r\n]*\$(?:\{{)?{re.escape(shell_name)}(?:\}})?[^\r\n]*\)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            rf"(?mi)^\s*\$(?P<variable>[A-Za-z_]\w*)\s*=\s*[^\r\n]*"
+            rf"(?:Resolve-Path|GetFullPath)[^\r\n]*\$(?:env:)?{re.escape(shell_name)}\b",
+        ),
+    ]
+    canonical = next(
+        (match for pattern in canonical_patterns if (match := pattern.search(command_text))),
+        None,
     )
     if canonical is None:
         return False
-    containment = re.search(
-        r"(?:"
-        r"case\b[\s\S]{0,400}(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)[\s\S]{0,120}/\*|"
-        r"(?:==|!=)[^\r\n]*(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)[^\r\n]*/\*|"
-        r"(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)[\s\S]{0,500}\.StartsWith\s*\(|"
-        r"\.StartsWith\s*\([^\r\n]*(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)"
-        r")",
-        command_text[canonical.end() :],
-        re.IGNORECASE,
+    variable = re.escape(canonical.group("variable"))
+    tail = command_text[canonical.end() :]
+    canonical_reference = rf"\$(?:\{{)?{variable}(?:\}})?"
+    root_variables = re.findall(
+        r"(?mi)^\s*\$?(?P<variable>[A-Za-z_]\w*)\s*=\s*[^\r\n]*"
+        r"(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)",
+        command_text,
     )
-    return containment is not None
+    root_names = ["GITHUB_WORKSPACE", "BUILD_SOURCESDIRECTORY", *root_variables]
+    root_reference = rf"\$(?:(?:env:)?(?:{'|'.join(map(re.escape, root_names))})|"
+    root_reference += rf"\{{(?:{'|'.join(map(re.escape, root_names))})\}})"
+    boundary_patterns = [
+        rf"case\s+['\"]?{canonical_reference}['\"]?\s+in"
+        rf"[\s\S]{{0,400}}{root_reference}[^\r\n]*/\*",
+        rf"\[\[[^\r\n]*{canonical_reference}[^\r\n]*(?:==|!=)"
+        rf"[^\r\n]*{root_reference}[^\r\n]*/\*",
+        rf"{canonical_reference}\.StartsWith\s*\([^\r\n]*{root_reference}",
+    ]
+    return any(re.search(pattern, tail, re.IGNORECASE) for pattern in boundary_patterns)
 
 
 def assert_named_checks(document: Mapping[str, Any], source: Path) -> str:
@@ -370,26 +427,30 @@ def test_repository_validation_workflow_contract() -> None:
         (
             "terraform",
             [
-                r"\bterraform\s+fmt\b[^\r\n]*(?:-check|--check)",
-                r"\bterraform\s+init\b[^\r\n]*-backend=false",
-                r"\bterraform\s+validate\b",
-                r"\btflint\b",
+                r"^(?:&\s*)?terraform\s+fmt\b.*(?:-check|--check)",
+                r"^(?:&\s*)?terraform\s+init\b.*-backend=false",
+                r"^(?:&\s*)?terraform\s+validate\b",
+                r"^(?:&\s*)?tflint\b",
             ],
             [r"format", r"init", r"lint", r"validate"],
         ),
         (
             "powershell",
             [
-                r"Language\.Parser\]::ParseFile|Parser\]::ParseFile",
-                r"\bTest-ModuleManifest\b",
-                r"\bInvoke-ScriptAnalyzer\b",
-                r"\bInvoke-Pester\b",
+                r"^\[System\.Management\.Automation\.Language\.Parser\]::ParseFile\b",
+                r"^(?:&\s*)?Test-ModuleManifest\b",
+                r"^(?:&\s*)?Invoke-ScriptAnalyzer\b",
+                r"^(?:&\s*)?Invoke-Pester\b",
             ],
             [r"pars", r"manifest", r"analy|lint", r"pester|test"],
         ),
         (
             "python",
-            [r"\bruff\s+format\b[^\r\n]*--check", r"\bruff\s+check\b", r"\bpytest\b"],
+            [
+                r"^(?:python\s+-m\s+)?ruff\s+format\b.*--check",
+                r"^(?:python\s+-m\s+)?ruff\s+check\b",
+                r"^(?:python\s+-m\s+)?pytest\b",
+            ],
             [r"format", r"lint|ruff", r"test|pytest"],
         ),
     ],
@@ -402,7 +463,7 @@ def test_reusable_workflows_execute_required_validation_phases(
     command_corpus = "\n".join(command for _trail, _shell, command in run_blocks(workflow))
     check_names = assert_named_checks(workflow, source)
     for pattern in command_patterns:
-        assert re.search(pattern, command_corpus, re.IGNORECASE), (
+        assert has_executable_invocation(command_corpus, pattern), (
             f"{source.as_posix()}: no validation command matches {pattern!r}"
         )
     for pattern in check_name_patterns:
@@ -458,22 +519,29 @@ def test_azure_template_parameter_contract(name: str, expected_parameters: set[s
         (
             "terraform",
             [
-                r"\bterraform\s+fmt\b[^\r\n]*(?:-check|--check)",
-                r"\bterraform\s+init\b[^\r\n]*-backend=false",
-                r"\bterraform\s+validate\b",
-                r"\btflint\b",
+                r"^(?:&\s*)?terraform\s+fmt\b.*(?:-check|--check)",
+                r"^(?:&\s*)?terraform\s+init\b.*-backend=false",
+                r"^(?:&\s*)?terraform\s+validate\b",
+                r"^(?:&\s*)?tflint\b",
             ],
         ),
         (
             "powershell",
             [
-                r"Parser\]::ParseFile",
-                r"\bTest-ModuleManifest\b",
-                r"\bInvoke-ScriptAnalyzer\b",
-                r"\bInvoke-Pester\b",
+                r"^\[System\.Management\.Automation\.Language\.Parser\]::ParseFile\b",
+                r"^(?:&\s*)?Test-ModuleManifest\b",
+                r"^(?:&\s*)?Invoke-ScriptAnalyzer\b",
+                r"^(?:&\s*)?Invoke-Pester\b",
             ],
         ),
-        ("python", [r"\bruff\s+format\b[^\r\n]*--check", r"\bruff\s+check\b", r"\bpytest\b"]),
+        (
+            "python",
+            [
+                r"^(?:python\s+-m\s+)?ruff\s+format\b.*--check",
+                r"^(?:python\s+-m\s+)?ruff\s+check\b",
+                r"^(?:python\s+-m\s+)?pytest\b",
+            ],
+        ),
     ],
 )
 def test_azure_templates_execute_required_validation_phases(
@@ -489,7 +557,7 @@ def test_azure_templates_execute_required_validation_phases(
     )
     assert display_names.strip(), f"{source.as_posix()}: validation steps need displayName values"
     for pattern in patterns:
-        assert re.search(pattern, commands, re.IGNORECASE), (
+        assert has_executable_invocation(commands, pattern), (
             f"{source.as_posix()}: no validation command matches {pattern!r}"
         )
 
@@ -509,9 +577,9 @@ def test_azure_example_imports_all_validation_templates() -> None:
         )
 
 
-@pytest.mark.policy
-def test_all_yaml_is_validation_only_and_has_no_credentials() -> None:
-    forbidden_keys = {
+def validation_policy_violations(document: Mapping[str, Any], source: Path) -> list[str]:
+    forbidden_exact_keys = {
+        "secret",
         "secrets",
         "credential",
         "credentials",
@@ -524,7 +592,14 @@ def test_all_yaml_is_validation_only_and_has_no_credentials() -> None:
         "awsaccesskeyid",
         "awssecretaccesskey",
         "azuresubscription",
+        "password",
+        "passwords",
+        "token",
+        "tokens",
+        "apikey",
+        "privatekey",
     }
+    forbidden_key_suffixes = ("secret", "password", "token", "apikey", "privatekey")
     forbidden_text = re.compile(
         r"(?:terraform\s+apply\b|azure/login|configure-aws-credentials|"
         r"az\s+(?:deployment|webapp\s+deploy)\b|aws\s+cloudformation\s+deploy\b|"
@@ -532,48 +607,67 @@ def test_all_yaml_is_validation_only_and_has_no_credentials() -> None:
         r"\bdeploy(?:ment)?\s+(?:job|stage)\b)",
         re.IGNORECASE,
     )
-    deployment_action = re.compile(
-        r"(?:azure/(?:webapps-deploy|functions-action)|actions/deploy-pages|"
-        r"amazon-ecs-deploy-task-definition|google-github-actions/deploy)",
-        re.IGNORECASE,
-    )
+    safe_validation_actions = {
+        "actions/checkout",
+        "actions/setup-python",
+        "actions/setup-node",
+        "hashicorp/setup-terraform",
+        "terraform-linters/setup-tflint",
+    }
     deployment_task = re.compile(
         r"(?:AzureResourceManagerTemplateDeployment|AzureWebApp|KubernetesManifest|"
-        r"Docker|HelmDeploy|AzureFunctionApp)@",
+        r"HelmDeploy|AzureFunctionApp)@",
         re.IGNORECASE,
     )
     violations: list[str] = []
+    for trail, value in walk(document):
+        location = ".".join(trail) or "<root>"
+        key = re.sub(r"[^a-z0-9]", "", trail[-1].lower()) if trail else ""
+        if key in forbidden_exact_keys or any(key.endswith(suffix) for suffix in forbidden_key_suffixes):
+            violations.append(f"{source.as_posix()}:{location} uses a credential field")
+        if key in {"environment", "environments", "deployment", "deployments"}:
+            violations.append(f"{source.as_posix()}:{location} defines a deployment target")
+        if (
+            len(trail) >= 2
+            and trail[-2].lower() in {"jobs", "stages"}
+            and re.search(r"deploy", trail[-1], re.IGNORECASE)
+        ):
+            violations.append(f"{source.as_posix()}:{location} defines a deployment job/stage")
+        if (
+            trail
+            and trail[-1].lower() in {"job", "stage"}
+            and isinstance(value, str)
+            and re.search(r"deploy", value, re.IGNORECASE)
+        ):
+            violations.append(f"{source.as_posix()}:{location} names a deployment job/stage")
+        if isinstance(value, str) and forbidden_text.search(value):
+            violations.append(f"{source.as_posix()}:{location} contains a deployment command")
+        if trail and trail[-1].lower() == "uses" and isinstance(value, str):
+            action = value.split("@", maxsplit=1)[0].lower()
+            if (
+                re.search(r"(?:deploy|release|publish)", action, re.IGNORECASE)
+                and action not in safe_validation_actions
+            ):
+                violations.append(f"{source.as_posix()}:{location} invokes deployment action")
+        if trail and trail[-1].lower() == "task" and isinstance(value, str):
+            if deployment_task.search(value):
+                violations.append(f"{source.as_posix()}:{location} invokes deployment task")
+            if re.match(r"Docker@", value, re.IGNORECASE):
+                task_node = document
+                for component in trail[:-1]:
+                    task_node = task_node[int(component)] if isinstance(task_node, list) else task_node[component]
+                docker_configuration = scalar_text(task_node)
+                if re.search(r"\b(?:push|login|buildandpush|deploy)\b", docker_configuration, re.IGNORECASE):
+                    violations.append(f"{source.as_posix()}:{location} invokes unsafe Docker task")
+    return violations
+
+
+@pytest.mark.policy
+def test_all_yaml_is_validation_only_and_has_no_credentials() -> None:
+    violations: list[str] = []
     for path in yaml_paths():
         relative = path.relative_to(REPOSITORY_ROOT)
-        document = load_yaml(relative)
-        for trail, value in walk(document):
-            location = ".".join(trail) or "<root>"
-            key = re.sub(r"[^a-z0-9]", "", trail[-1].lower()) if trail else ""
-            if key in forbidden_keys:
-                violations.append(f"{relative.as_posix()}:{location} uses a credential field")
-            if key in {"environment", "environments", "deployment", "deployments"}:
-                violations.append(f"{relative.as_posix()}:{location} defines a deployment target")
-            if (
-                len(trail) >= 2
-                and trail[-2].lower() in {"jobs", "stages"}
-                and re.search(r"deploy", trail[-1], re.IGNORECASE)
-            ):
-                violations.append(f"{relative.as_posix()}:{location} defines a deployment job/stage")
-            if (
-                trail
-                and trail[-1].lower() in {"job", "stage"}
-                and isinstance(value, str)
-                and re.search(r"deploy", value, re.IGNORECASE)
-            ):
-                violations.append(f"{relative.as_posix()}:{location} names a deployment job/stage")
-            if isinstance(value, str) and forbidden_text.search(value):
-                violations.append(f"{relative.as_posix()}:{location} contains a deployment command")
-            if trail and trail[-1].lower() == "uses" and isinstance(value, str):
-                if deployment_action.search(value):
-                    violations.append(f"{relative.as_posix()}:{location} invokes deployment action")
-            if trail and trail[-1].lower() == "task" and isinstance(value, str):
-                if deployment_task.search(value):
-                    violations.append(f"{relative.as_posix()}:{location} invokes deployment task")
+        violations.extend(validation_policy_violations(load_yaml(relative), relative))
     assert not violations, "Validation-only policy violations:\n" + "\n".join(violations)
 
 
@@ -726,6 +820,21 @@ def test_each_path_variable_occurrence_must_be_quoted() -> None:
 
 
 @pytest.mark.selftest
+def test_validation_tool_names_in_echo_comments_and_here_documents_do_not_count() -> None:
+    adversarial = """# terraform validate
+echo "terraform fmt -check"
+printf '%s' 'terraform init -backend=false'
+cat <<'COMMANDS'
+tflint
+terraform validate
+COMMANDS
+"""
+    assert not has_executable_invocation(adversarial, r"^(?:&\s*)?terraform\s+validate\b")
+    assert not has_executable_invocation(adversarial, r"^(?:&\s*)?tflint\b")
+    assert has_executable_invocation("terraform validate", r"^(?:&\s*)?terraform\s+validate\b")
+
+
+@pytest.mark.selftest
 def test_containment_requires_canonicalization_before_boundary_check() -> None:
     safe = """safe_path="$(realpath -- "$WORKING_DIRECTORY")"
 case "$safe_path" in
@@ -739,7 +848,43 @@ esac
 esac
 safe_path="$(realpath -- "$WORKING_DIRECTORY")"
 """
+    compares_original = """safe_path="$(realpath -- "$WORKING_DIRECTORY")"
+case "$WORKING_DIRECTORY" in
+  "$GITHUB_WORKSPACE"/*) ;;
+  *) exit 2 ;;
+esac
+"""
     assert has_canonical_containment(safe, "working-directory")
     assert not has_canonical_containment(safe, "test-path")
     assert not has_canonical_containment(keyword_only, "working-directory")
     assert not has_canonical_containment(reversed_order, "working-directory")
+    assert not has_canonical_containment(compares_original, "working-directory")
+
+
+@pytest.mark.selftest
+def test_policy_allows_build_only_docker_and_arbitrary_write_text() -> None:
+    safe = {
+        "steps": [
+            {"uses": "actions/checkout@v4"},
+            {"task": "Docker@2", "inputs": {"command": "build", "Dockerfile": "Dockerfile"}},
+            {"note": "write"},
+        ]
+    }
+    assert validation_policy_violations(safe, Path("safe.yml")) == []
+
+
+@pytest.mark.selftest
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"inputs": {"password": "value"}},
+        {"inputs": {"release_token": "value"}},
+        {"inputs": {"api-key": "value"}},
+        {"inputs": {"private_key": "value"}},
+        {"steps": [{"uses": "vendor/publish-results@v1"}]},
+        {"steps": [{"task": "Docker@2", "inputs": {"command": "buildAndPush"}}]},
+        {"steps": [{"task": "Docker@2", "inputs": {"command": "login"}}]},
+    ],
+)
+def test_policy_rejects_credential_and_delivery_bypasses(document: Mapping[str, Any]) -> None:
+    assert validation_policy_violations(document, Path("unsafe.yml"))
