@@ -427,12 +427,54 @@ def test_repository_validation_workflow_contract() -> None:
     for job_key, job in jobs.items():
         if not isinstance(job, Mapping) or str(job.get("uses")) not in expected_with:
             continue
+        condition = str(job.get("if", "")).lower()
+        assert "workflow_dispatch" in condition and "run-validations" in condition, (
+            f"{source.as_posix()}: reusable demo job {job_key} must remain manual-only"
+        )
         supplied = job.get("with")
         assert isinstance(supplied, Mapping), f"{source.as_posix()}: job {job_key} needs with inputs"
         assert set(supplied) == expected_with[str(job["uses"])], (
             f"{source.as_posix()}: job {job_key} must pass exactly "
             f"{sorted(expected_with[str(job['uses'])])}"
         )
+
+    quality_jobs: list[tuple[str, Mapping[str, Any]]] = []
+    for job_key, job in jobs.items():
+        if not isinstance(job, Mapping) or "uses" in job or "if" in job:
+            continue
+        steps = job.get("steps")
+        if isinstance(steps, list):
+            quality_jobs.append((str(job_key), job))
+    assert quality_jobs, (
+        f"{source.as_posix()}: push and pull requests need an ungated repository-quality job"
+    )
+
+    quality_key, quality_job = quality_jobs[0]
+    quality_steps = quality_job.get("steps")
+    assert isinstance(quality_steps, list)
+    commands = "\n".join(
+        command for _trail, _shell, command in run_blocks({"job": quality_job})
+    )
+    assert has_executable_invocation(commands, r"^(?:python\s+-m\s+)?pytest\b"), (
+        f"{source.as_posix()}: quality job {quality_key} must execute Pytest"
+    )
+    assert any(
+        re.search(r'(?:^|/)actionlint"?\s+', line, re.IGNORECASE)
+        for line in executable_lines(commands)
+    ), f"{source.as_posix()}: quality job {quality_key} must execute actionlint"
+    assert has_executable_invocation(commands, r"^sha256sum\s+--check\b"), (
+        f"{source.as_posix()}: actionlint archive needs checksum verification"
+    )
+    checkout_steps = [
+        step
+        for step in quality_steps
+        if isinstance(step, Mapping)
+        and str(step.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkout_steps) == 1
+    checkout_with = checkout_steps[0].get("with")
+    assert isinstance(checkout_with, Mapping)
+    assert checkout_with.get("persist-credentials") is False
 
 
 @pytest.mark.github

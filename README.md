@@ -40,7 +40,7 @@ Each template checks out source without persisting credentials, installs pinned 
 | `.github/workflows/reusable-terraform.yml` | Terraform validation callable by another GitHub workflow |
 | `.github/workflows/reusable-powershell.yml` | PowerShell source and test validation callable by another GitHub workflow |
 | `.github/workflows/reusable-python.yml` | Python source and test validation callable by another GitHub workflow |
-| `.github/workflows/validate-repository.yml` | Push, pull request, and manual entry point for repository-local examples |
+| `.github/workflows/validate-repository.yml` | Always-on repository quality checks plus manual-only technology demonstrations |
 | `azure-pipelines/templates/terraform-validate.yml` | Terraform validation stage for Azure DevOps |
 | `azure-pipelines/templates/powershell-test.yml` | PowerShell validation stage for Azure DevOps |
 | `azure-pipelines/templates/python-test.yml` | Python validation stage for Azure DevOps |
@@ -78,6 +78,8 @@ actionlint .github/workflows/*.yml
 ```
 
 The test suite parses every YAML document and checks the reusable interfaces, required tool invocations, read-only permissions, immutable action references, strict shell behavior, path containment, and absence of deployment or credential fields.
+
+The repository dispatcher runs these Python policy tests and checksum-verified `actionlint` on every push, pull request, and manual invocation. Its Terraform, PowerShell, and Python technology demonstrations remain disabled by default because their placeholder source directories are not part of this reference repository. To exercise those demos, first add matching safe fixtures, then manually run the workflow with `run-validations` enabled.
 
 ## GitHub reusable workflows
 
@@ -264,11 +266,11 @@ Not verified in this local implementation:
 - cloud, deployment, credential, or service-connection behavior, because none is in scope
 - consumer projects beyond the synthetic/static contracts in this repository
 
-The manual `validate-repository.yml` examples are gated by `run-validations`. Its example source directories are reference placeholders and must exist before enabling that input.
+The always-on repository-quality job in `validate-repository.yml` is configured locally but has not yet been verified on a GitHub-hosted runner. The three technology demonstration jobs are separately gated by `run-validations`; their example source directories are reference placeholders and must exist before enabling that input.
 
 ## Maintenance status
 
-Status: actively maintained reference implementation. Dependency updates are checked monthly. Interface or security-policy changes should include updated tests and documentation. See `CONTRIBUTING.md` for the validation contract and `SECURITY.md` for private reporting guidance.
+Status: actively maintained reference implementation. Dependabot is configured for monthly GitHub Actions and Python dependency checks; hosted execution of that schedule is still unverified. Interface or security-policy changes should include updated tests and documentation. See `CONTRIBUTING.md` for the validation contract and `SECURITY.md` for private reporting guidance.
 
 ## License
 
