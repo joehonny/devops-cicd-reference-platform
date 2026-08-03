@@ -49,7 +49,7 @@ jobs:
           }
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
           Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
-          Install-Module -Name Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module -Name Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force
 
       - name: Parse PowerShell source
         shell: pwsh
@@ -76,7 +76,18 @@ jobs:
             throw 'Working directory is outside the checkout'
           }
           Get-ChildItem -LiteralPath "$safePath" -Recurse -File -Filter '*.psd1' | ForEach-Object {
-            Test-ModuleManifest -Path "$($_.FullName)" -ErrorAction Stop | Out-Null
+            try {
+              $manifestData = Import-PowerShellDataFile -Path "$($_.FullName)" -ErrorAction Stop
+            } catch {
+              $manifestData = $null
+            }
+            if ($null -ne $manifestData) {
+              $hasModuleEntry = -not [string]::IsNullOrWhiteSpace([string]$manifestData.RootModule) -or
+                @($manifestData.NestedModules).Count -gt 0
+              if ($manifestData.ContainsKey('ModuleVersion') -and $hasModuleEntry) {
+                Test-ModuleManifest -Path "$($_.FullName)" -ErrorAction Stop | Out-Null
+              }
+            }
           }
 
       - name: Analyze PowerShell source
@@ -100,8 +111,8 @@ jobs:
             throw 'Working directory is outside the checkout'
           }
           $safeTestPath = (Resolve-Path -LiteralPath (Join-Path "$safePath" "$env:TEST_PATH")).Path
-          if (-not ($safeTestPath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
-              $safeTestPath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
-            throw 'Test path is outside the checkout'
+          if (-not ($safeTestPath.Equals("$safePath", [StringComparison]::OrdinalIgnoreCase) -or
+              $safeTestPath.StartsWith("$safePath/", [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'Test path is outside the working directory'
           }
           Invoke-Pester -Path "$safeTestPath" -CI

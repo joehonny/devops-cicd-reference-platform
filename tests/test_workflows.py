@@ -257,8 +257,9 @@ def assert_input_contract(
         assert isinstance(specification, Mapping), (
             f"{source.as_posix()}: input {name!r} must be a mapping"
         )
-        assert specification.get("type") == "string", (
-            f"{source.as_posix()}: input {name!r} must declare type: string"
+        expected_type = "boolean" if name == "install-project" else "string"
+        assert specification.get("type") == expected_type, (
+            f"{source.as_posix()}: input {name!r} must declare type: {expected_type}"
         )
         assert "description" in specification, (
             f"{source.as_posix()}: input {name!r} needs a description"
@@ -271,6 +272,12 @@ def assert_input_contract(
         elif name == "test-path":
             assert specification.get("required") is False
             assert isinstance(specification.get("default"), str)
+        elif name == "dependency-file":
+            assert specification.get("required") is False
+            assert specification.get("default") == ""
+        elif name == "install-project":
+            assert specification.get("required") is False
+            assert specification.get("default") is False
         else:
             assert specification.get("required") is False
             assert str(specification.get("default", "")).strip(), (
@@ -338,7 +345,16 @@ def test_every_repository_yaml_parses_as_a_mapping() -> None:
     [
         ("terraform", {"working-directory", "terraform-version"}),
         ("powershell", {"working-directory", "powershell-version", "test-path"}),
-        ("python", {"working-directory", "python-version", "test-path"}),
+        (
+            "python",
+            {
+                "working-directory",
+                "python-version",
+                "test-path",
+                "dependency-file",
+                "install-project",
+            },
+        ),
     ],
 )
 def test_reusable_github_workflow_contract(name: str, expected_inputs: set[str]) -> None:
@@ -401,6 +417,8 @@ def test_repository_validation_workflow_contract() -> None:
             "working-directory",
             "python-version",
             "test-path",
+            "dependency-file",
+            "install-project",
         },
     }
     for job_key, job in jobs.items():
@@ -464,6 +482,63 @@ def test_reusable_workflows_execute_required_validation_phases(
         assert re.search(pattern, check_names, re.IGNORECASE), (
             f"{source.as_posix()}: no named check identifies phase {pattern!r}"
         )
+
+
+@pytest.mark.github
+def test_reviewed_github_workflow_safety_regressions() -> None:
+    terraform = load_yaml(GITHUB_WORKFLOWS["terraform"])
+    powershell = load_yaml(GITHUB_WORKFLOWS["powershell"])
+    python = load_yaml(GITHUB_WORKFLOWS["python"])
+
+    terraform_commands = "\n".join(
+        command for _trail, _shell, command in run_blocks(terraform)
+    )
+    init_position = terraform_commands.find("tflint --init")
+    lint_position = terraform_commands.find("tflint --recursive")
+    assert 0 <= init_position < lint_position, "TFLint plugins must initialize before linting"
+
+    powershell_commands = "\n".join(
+        command for _trail, _shell, command in run_blocks(powershell)
+    )
+    assert re.search(
+        r"\$safeTestPath\.StartsWith\(\"\$safePath/\"",
+        powershell_commands,
+        re.IGNORECASE,
+    )
+    assert "Import-PowerShellDataFile" in powershell_commands
+    assert "ModuleVersion" in powershell_commands
+    assert re.search(r"RootModule|NestedModules", powershell_commands)
+    assert "SkipPublisherCheck" not in powershell_commands
+
+    python_commands = "\n".join(
+        command for _trail, _shell, command in run_blocks(python)
+    )
+    assert re.search(
+        r'case\s+"\$safe_test_path"\s+in\s*\n\s*"\$safe_path"\|"\$safe_path"/\*',
+        python_commands,
+    )
+    assert re.search(
+        r'case\s+"\$safe_dependency_file"\s+in\s*\n\s*"\$safe_path"\|"\$safe_path"/\*',
+        python_commands,
+    )
+    assert 'python -m pip install --requirement "$safe_dependency_file"' in python_commands
+    assert 'python -m pip install "$safe_path"' in python_commands
+    validation_patterns = (
+        r"^ruff\s+format\b",
+        r"^ruff\s+check\b",
+        r"^pytest\b",
+    )
+    for pattern in validation_patterns:
+        matching_blocks = [
+            command
+            for _trail, _shell, command in run_blocks(python)
+            if has_executable_invocation(command, pattern)
+        ]
+        assert len(matching_blocks) == 1
+        executable = "\n".join(executable_lines(matching_blocks[0]))
+        validation = re.search(pattern, executable, re.MULTILINE)
+        assert validation is not None
+        assert executable.rfind('cd -- "$safe_path"', 0, validation.start()) >= 0
 
 
 @pytest.mark.azure
@@ -750,8 +825,8 @@ def test_path_parameters_are_passed_via_environment_and_quoted() -> None:
                         )
         required_paths = {
             GITHUB_WORKFLOWS["terraform"]: {"working-directory"},
-            GITHUB_WORKFLOWS["powershell"]: {"working-directory", "test-path"},
-            GITHUB_WORKFLOWS["python"]: {"working-directory", "test-path"},
+            GITHUB_WORKFLOWS["powershell"]: {"working-directory"},
+            GITHUB_WORKFLOWS["python"]: {"working-directory"},
             AZURE_PIPELINES["terraform"]: {"working-directory"},
             AZURE_PIPELINES["powershell"]: {"working-directory", "test-path"},
             AZURE_PIPELINES["python"]: {"working-directory", "test-path"},

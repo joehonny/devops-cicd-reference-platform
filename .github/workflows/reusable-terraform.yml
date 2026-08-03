@@ -75,6 +75,7 @@ jobs:
             *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
           esac
           cd -- "$safe_path"
+          tflint --init
           tflint --recursive
 
       - name: Validate Terraform configuration

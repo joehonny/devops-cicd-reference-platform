@@ -40,3 +40,5 @@ jobs:
       working-directory: examples/python
       python-version: "3.12"
       test-path: tests
+      dependency-file: ""
+      install-project: false

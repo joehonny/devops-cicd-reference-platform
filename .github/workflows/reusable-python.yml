@@ -18,6 +18,16 @@ on:
         type: string
         required: false
         default: "tests"
+      dependency-file:
+        description: Optional requirements file relative to the working directory
+        type: string
+        required: false
+        default: ""
+      install-project:
+        description: Install the validated project before checks
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -30,6 +40,8 @@ jobs:
       WORKING_DIRECTORY: ${{ inputs.working-directory }}
       PYTHON_VERSION: ${{ inputs.python-version }}
       TEST_PATH: ${{ inputs.test-path }}
+      DEPENDENCY_FILE: ${{ inputs.dependency-file }}
+      INSTALL_PROJECT: ${{ inputs.install-project }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,6 +59,34 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --disable-pip-version-check ruff==0.12.11 pytest==8.4.1 PyYAML==6.0.2
+          safe_path=$(realpath -- "$WORKING_DIRECTORY")
+          case "$safe_path" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
+            *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+          esac
+          if [[ -n "$DEPENDENCY_FILE" ]]; then
+            safe_dependency_file=$(realpath -- "$safe_path/$DEPENDENCY_FILE")
+            case "$safe_dependency_file" in
+              "$safe_path"|"$safe_path"/*) ;;
+              *) printf 'Dependency file is outside the working directory\n' >&2; exit 2 ;;
+            esac
+            if [[ ! -f "$safe_dependency_file" ]]; then
+              printf 'Dependency file does not exist or is not a file\n' >&2
+              exit 2
+            fi
+            python -m pip install --requirement "$safe_dependency_file"
+          fi
+          case "$INSTALL_PROJECT" in
+            true)
+              if [[ ! -f "$safe_path/pyproject.toml" && ! -f "$safe_path/setup.py" ]]; then
+                printf 'Project installation requested, but no project metadata exists\n' >&2
+                exit 2
+              fi
+              python -m pip install "$safe_path"
+              ;;
+            false) ;;
+            *) printf 'install-project must be true or false\n' >&2; exit 2 ;;
+          esac
 
       - name: Check Python format
         shell: bash
@@ -57,7 +97,8 @@ jobs:
             "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
             *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
           esac
-          ruff format --check "$safe_path"
+          cd -- "$safe_path"
+          ruff format --check .
 
       - name: Lint Python source
         shell: bash
@@ -68,7 +109,8 @@ jobs:
             "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
             *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
           esac
-          ruff check "$safe_path"
+          cd -- "$safe_path"
+          ruff check .
 
       - name: Run Pytest tests
         shell: bash
@@ -81,7 +123,8 @@ jobs:
           esac
           safe_test_path=$(realpath -- "$safe_path/$TEST_PATH")
           case "$safe_test_path" in
-            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
-            *) printf 'Test path is outside the checkout\n' >&2; exit 2 ;;
+            "$safe_path"|"$safe_path"/*) ;;
+            *) printf 'Test path is outside the working directory\n' >&2; exit 2 ;;
           esac
+          cd -- "$safe_path"
           pytest "$safe_test_path"
