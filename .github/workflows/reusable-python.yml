@@ -58,7 +58,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check ruff==0.12.11 pytest==8.4.1 PyYAML==6.0.2
           safe_path=$(realpath -- "$WORKING_DIRECTORY")
           case "$safe_path" in
             "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
@@ -87,6 +86,7 @@ jobs:
             false) ;;
             *) printf 'install-project must be true or false\n' >&2; exit 2 ;;
           esac
+          python -m pip install --disable-pip-version-check ruff==0.12.11 pytest==8.4.1 PyYAML==6.0.2
 
       - name: Check Python format
         shell: bash

@@ -56,8 +56,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
-          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
-              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::Ordinal) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::Ordinal))) {
             throw 'Working directory is outside the checkout'
           }
           Get-ChildItem -LiteralPath "$safePath" -Recurse -File -Include '*.ps1','*.psm1','*.psd1' | ForEach-Object {
@@ -71,8 +71,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
-          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
-              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::Ordinal) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::Ordinal))) {
             throw 'Working directory is outside the checkout'
           }
           Get-ChildItem -LiteralPath "$safePath" -Recurse -File -Filter '*.psd1' | ForEach-Object {
@@ -95,8 +95,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
-          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
-              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::Ordinal) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::Ordinal))) {
             throw 'Working directory is outside the checkout'
           }
           Invoke-ScriptAnalyzer -Path "$safePath" -Recurse -Severity Error -EnableExit
@@ -106,13 +106,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
-          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
-              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::Ordinal) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::Ordinal))) {
             throw 'Working directory is outside the checkout'
           }
           $safeTestPath = (Resolve-Path -LiteralPath (Join-Path "$safePath" "$env:TEST_PATH")).Path
-          if (-not ($safeTestPath.Equals("$safePath", [StringComparison]::OrdinalIgnoreCase) -or
-              $safeTestPath.StartsWith("$safePath/", [StringComparison]::OrdinalIgnoreCase))) {
+          if (-not ($safeTestPath.Equals("$safePath", [StringComparison]::Ordinal) -or
+              $safeTestPath.StartsWith("$safePath/", [StringComparison]::Ordinal))) {
             throw 'Test path is outside the working directory'
           }
           Invoke-Pester -Path "$safeTestPath" -CI

@@ -509,6 +509,8 @@ def test_reviewed_github_workflow_safety_regressions() -> None:
     assert "ModuleVersion" in powershell_commands
     assert re.search(r"RootModule|NestedModules", powershell_commands)
     assert "SkipPublisherCheck" not in powershell_commands
+    assert "OrdinalIgnoreCase" not in powershell_commands
+    assert "[StringComparison]::Ordinal" in powershell_commands
 
     python_commands = "\n".join(
         command for _trail, _shell, command in run_blocks(python)
@@ -523,6 +525,16 @@ def test_reviewed_github_workflow_safety_regressions() -> None:
     )
     assert 'python -m pip install --requirement "$safe_dependency_file"' in python_commands
     assert 'python -m pip install "$safe_path"' in python_commands
+    pinned_tools = (
+        "python -m pip install --disable-pip-version-check "
+        "ruff==0.12.11 pytest==8.4.1 PyYAML==6.0.2"
+    )
+    pinned_position = python_commands.find(pinned_tools)
+    assert pinned_position >= 0
+    assert python_commands.find(
+        'python -m pip install --requirement "$safe_dependency_file"'
+    ) < pinned_position
+    assert python_commands.find('python -m pip install "$safe_path"') < pinned_position
     validation_patterns = (
         r"^ruff\s+format\b",
         r"^ruff\s+check\b",
