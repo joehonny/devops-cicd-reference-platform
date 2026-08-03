@@ -1,0 +1,87 @@
+name: Reusable Python validation
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Repository-relative directory containing Python source
+        type: string
+        required: false
+        default: "."
+      python-version:
+        description: Exact Python version to use
+        type: string
+        required: false
+        default: "3.12"
+      test-path:
+        description: Test path relative to the working directory
+        type: string
+        required: false
+        default: "tests"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Python validation
+    runs-on: ubuntu-24.04
+    env:
+      WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      PYTHON_VERSION: ${{ inputs.python-version }}
+      TEST_PATH: ${{ inputs.test-path }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+
+      - name: Install pinned validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check ruff==0.12.11 pytest==8.4.1 PyYAML==6.0.2
+
+      - name: Check Python format
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_path=$(realpath -- "$WORKING_DIRECTORY")
+          case "$safe_path" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
+            *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+          esac
+          ruff format --check "$safe_path"
+
+      - name: Lint Python source
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_path=$(realpath -- "$WORKING_DIRECTORY")
+          case "$safe_path" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
+            *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+          esac
+          ruff check "$safe_path"
+
+      - name: Run Pytest tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          safe_path=$(realpath -- "$WORKING_DIRECTORY")
+          case "$safe_path" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
+            *) printf 'Working directory is outside the checkout\n' >&2; exit 2 ;;
+          esac
+          safe_test_path=$(realpath -- "$safe_path/$TEST_PATH")
+          case "$safe_test_path" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*) ;;
+            *) printf 'Test path is outside the checkout\n' >&2; exit 2 ;;
+          esac
+          pytest "$safe_test_path"

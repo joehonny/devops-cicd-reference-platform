@@ -1,0 +1,42 @@
+name: Validate repository
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      run-validations:
+        description: Run all validation examples in a repository that provides matching source trees
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform reusable workflow example
+    if: github.event_name == 'workflow_dispatch' && inputs.run-validations
+    uses: ./.github/workflows/reusable-terraform.yml
+    with:
+      working-directory: examples/terraform
+      terraform-version: "1.9.7"
+
+  powershell-validation:
+    name: PowerShell reusable workflow example
+    if: github.event_name == 'workflow_dispatch' && inputs.run-validations
+    uses: ./.github/workflows/reusable-powershell.yml
+    with:
+      working-directory: examples/powershell
+      powershell-version: "7.4"
+      test-path: tests
+
+  python:
+    name: Python reusable workflow example
+    if: github.event_name == 'workflow_dispatch' && inputs.run-validations
+    uses: ./.github/workflows/reusable-python.yml
+    with:
+      working-directory: examples/python
+      python-version: "3.12"
+      test-path: tests

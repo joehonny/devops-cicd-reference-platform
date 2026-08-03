@@ -1,0 +1,107 @@
+name: Reusable PowerShell validation
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Repository-relative directory containing PowerShell source
+        type: string
+        required: false
+        default: "."
+      powershell-version:
+        description: PowerShell major and minor runtime channel
+        type: string
+        required: false
+        default: "7.4"
+      test-path:
+        description: Test path relative to the working directory
+        type: string
+        required: false
+        default: "tests"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: PowerShell validation
+    runs-on: ubuntu-24.04
+    container:
+      image: mcr.microsoft.com/powershell:${{ inputs.powershell-version }}-ubuntu-22.04
+    env:
+      WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      POWERSHELL_VERSION: ${{ inputs.powershell-version }}
+      TEST_PATH: ${{ inputs.test-path }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install PowerShell validation modules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requestedVersion = [version]"$env:POWERSHELL_VERSION"
+          if ($PSVersionTable.PSVersion.Major -ne $requestedVersion.Major -or
+              $PSVersionTable.PSVersion.Minor -ne $requestedVersion.Minor) {
+            throw "PowerShell $($PSVersionTable.PSVersion) does not match requested major.minor $requestedVersion"
+          }
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Force
+          Install-Module -Name Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Parse PowerShell source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'Working directory is outside the checkout'
+          }
+          Get-ChildItem -LiteralPath "$safePath" -Recurse -File -Include '*.ps1','*.psm1','*.psd1' | ForEach-Object {
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count -gt 0) { throw ($parseErrors -join [Environment]::NewLine) }
+          }
+
+      - name: Validate PowerShell module manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'Working directory is outside the checkout'
+          }
+          Get-ChildItem -LiteralPath "$safePath" -Recurse -File -Filter '*.psd1' | ForEach-Object {
+            Test-ModuleManifest -Path "$($_.FullName)" -ErrorAction Stop | Out-Null
+          }
+
+      - name: Analyze PowerShell source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'Working directory is outside the checkout'
+          }
+          Invoke-ScriptAnalyzer -Path "$safePath" -Recurse -Severity Error -EnableExit
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $safePath = (Resolve-Path -LiteralPath (Join-Path "$env:GITHUB_WORKSPACE" "$env:WORKING_DIRECTORY")).Path
+          if (-not ($safePath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
+              $safePath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'Working directory is outside the checkout'
+          }
+          $safeTestPath = (Resolve-Path -LiteralPath (Join-Path "$safePath" "$env:TEST_PATH")).Path
+          if (-not ($safeTestPath.Equals("$env:GITHUB_WORKSPACE", [StringComparison]::OrdinalIgnoreCase) -or
+              $safeTestPath.StartsWith("$env:GITHUB_WORKSPACE/", [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'Test path is outside the checkout'
+          }
+          Invoke-Pester -Path "$safeTestPath" -CI
