@@ -109,10 +109,6 @@ def mapping_at(document: Mapping[str, Any], key: str, source: Path) -> Mapping[s
     return value
 
 
-def scalar_text(document: Any) -> str:
-    return "\n".join(value for _trail, value in walk(document) if isinstance(value, str))
-
-
 def expressions(document: Any) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for _trail, value in walk(document):
@@ -173,9 +169,13 @@ def executable_lines(command_text: str) -> list[str]:
         here_string = re.search(r"@(['\"])\s*$", stripped)
         if here_string:
             powershell_here_end = f"{here_string.group(1)}@"
-        heredoc = re.search(r"<<-?\s*['\"]?([A-Za-z_][\w-]*)['\"]?\s*$", stripped)
+        heredoc = re.search(
+            r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][\w-]*)"
+            r"(?P=quote)(?:\s+\d*(?:>>?|<<?)\s*\S+)*(?:\s+#.*)?$",
+            stripped,
+        )
         if heredoc:
-            heredoc_end = heredoc.group(1)
+            heredoc_end = heredoc.group("delimiter")
         lines.append(stripped)
     return lines
 
@@ -207,14 +207,8 @@ def has_canonical_containment(command_text: str, path_name: str) -> bool:
     variable = re.escape(canonical.group("variable"))
     tail = command_text[canonical.end() :]
     canonical_reference = rf"\$(?:\{{)?{variable}(?:\}})?"
-    root_variables = re.findall(
-        r"(?mi)^\s*\$?(?P<variable>[A-Za-z_]\w*)\s*=\s*[^\r\n]*"
-        r"(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)",
-        command_text,
-    )
-    root_names = ["GITHUB_WORKSPACE", "BUILD_SOURCESDIRECTORY", *root_variables]
-    root_reference = rf"\$(?:(?:env:)?(?:{'|'.join(map(re.escape, root_names))})|"
-    root_reference += rf"\{{(?:{'|'.join(map(re.escape, root_names))})\}})"
+    root_names = "GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY"
+    root_reference = rf"\$(?:(?:env:)?(?:{root_names})|\{{(?:{root_names})\}})"
     boundary_patterns = [
         rf"case\s+['\"]?{canonical_reference}['\"]?\s+in"
         rf"[\s\S]{{0,400}}{root_reference}[^\r\n]*/\*",
@@ -644,11 +638,25 @@ def validation_policy_violations(document: Mapping[str, Any], source: Path) -> l
             violations.append(f"{source.as_posix()}:{location} contains a deployment command")
         if trail and trail[-1].lower() == "uses" and isinstance(value, str):
             action = value.split("@", maxsplit=1)[0].lower()
+            action_node: Any = document
+            for component in trail[:-1]:
+                action_node = (
+                    action_node[int(component)]
+                    if isinstance(action_node, list)
+                    else action_node[component]
+                )
             if (
                 re.search(r"(?:deploy|release|publish)", action, re.IGNORECASE)
                 and action not in safe_validation_actions
             ):
                 violations.append(f"{source.as_posix()}:{location} invokes deployment action")
+            if action == "docker/login-action":
+                violations.append(f"{source.as_posix()}:{location} invokes Docker login action")
+            if action == "docker/build-push-action" and isinstance(action_node, Mapping):
+                action_inputs = action_node.get("with", {})
+                push = action_inputs.get("push", False) if isinstance(action_inputs, Mapping) else False
+                if push is True or str(push).strip().lower() == "true":
+                    violations.append(f"{source.as_posix()}:{location} enables Docker push")
         if trail and trail[-1].lower() == "task" and isinstance(value, str):
             if deployment_task.search(value):
                 violations.append(f"{source.as_posix()}:{location} invokes deployment task")
@@ -656,8 +664,13 @@ def validation_policy_violations(document: Mapping[str, Any], source: Path) -> l
                 task_node = document
                 for component in trail[:-1]:
                     task_node = task_node[int(component)] if isinstance(task_node, list) else task_node[component]
-                docker_configuration = scalar_text(task_node)
-                if re.search(r"\b(?:push|login|buildandpush|deploy)\b", docker_configuration, re.IGNORECASE):
+                task_inputs = task_node.get("inputs", {}) if isinstance(task_node, Mapping) else {}
+                docker_command = (
+                    str(task_inputs.get("command", "")).strip().lower()
+                    if isinstance(task_inputs, Mapping)
+                    else ""
+                )
+                if docker_command in {"push", "login", "buildandpush"}:
                     violations.append(f"{source.as_posix()}:{location} invokes unsafe Docker task")
     return violations
 
@@ -824,10 +837,13 @@ def test_validation_tool_names_in_echo_comments_and_here_documents_do_not_count(
     adversarial = """# terraform validate
 echo "terraform fmt -check"
 printf '%s' 'terraform init -backend=false'
-cat <<'COMMANDS'
+cat <<'COMMANDS' >/dev/null
 tflint
 terraform validate
 COMMANDS
+cat <<COMMANDS_2 # ignored validation text
+terraform validate
+COMMANDS_2
 """
     assert not has_executable_invocation(adversarial, r"^(?:&\s*)?terraform\s+validate\b")
     assert not has_executable_invocation(adversarial, r"^(?:&\s*)?tflint\b")
@@ -854,11 +870,19 @@ case "$WORKING_DIRECTORY" in
   *) exit 2 ;;
 esac
 """
+    derived_root_alias = """root_alias="$(realpath -- "$GITHUB_WORKSPACE/../")"
+safe_path="$(realpath -- "$WORKING_DIRECTORY")"
+case "$safe_path" in
+  "$root_alias"/*) ;;
+  *) exit 2 ;;
+esac
+"""
     assert has_canonical_containment(safe, "working-directory")
     assert not has_canonical_containment(safe, "test-path")
     assert not has_canonical_containment(keyword_only, "working-directory")
     assert not has_canonical_containment(reversed_order, "working-directory")
     assert not has_canonical_containment(compares_original, "working-directory")
+    assert not has_canonical_containment(derived_root_alias, "working-directory")
 
 
 @pytest.mark.selftest
@@ -866,7 +890,15 @@ def test_policy_allows_build_only_docker_and_arbitrary_write_text() -> None:
     safe = {
         "steps": [
             {"uses": "actions/checkout@v4"},
-            {"task": "Docker@2", "inputs": {"command": "build", "Dockerfile": "Dockerfile"}},
+            {"uses": "docker/build-push-action@v6", "with": {"push": False}},
+            {
+                "task": "Docker@2",
+                "inputs": {
+                    "command": "build",
+                    "repository": "login-service",
+                    "Dockerfile": "Dockerfile",
+                },
+            },
             {"note": "write"},
         ]
     }
@@ -882,6 +914,8 @@ def test_policy_allows_build_only_docker_and_arbitrary_write_text() -> None:
         {"inputs": {"api-key": "value"}},
         {"inputs": {"private_key": "value"}},
         {"steps": [{"uses": "vendor/publish-results@v1"}]},
+        {"steps": [{"uses": "docker/login-action@v3"}]},
+        {"steps": [{"uses": "docker/build-push-action@v6", "with": {"push": True}}]},
         {"steps": [{"task": "Docker@2", "inputs": {"command": "buildAndPush"}}]},
         {"steps": [{"task": "Docker@2", "inputs": {"command": "login"}}]},
     ],
