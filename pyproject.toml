@@ -18,3 +18,9 @@ test = [
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests"]
+markers = [
+  "github: GitHub workflow contracts; during Task 2 run: pytest -m 'github or policy'",
+  "azure: Azure Pipelines contracts; during Task 3 run: pytest -m 'azure or policy'",
+  "policy: repository-wide parsing and validation-only safety contracts",
+  "selftest: adversarial unit tests for the contract-test helpers",
+]

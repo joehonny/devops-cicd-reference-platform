@@ -1,4 +1,10 @@
-"""Static, offline safety contracts for the repository's pipeline YAML."""
+"""Static, offline safety contracts for the repository's pipeline YAML.
+
+Run ``pytest`` for the eventual complete platform. During phased implementation,
+Task 2 uses ``pytest -m "github or policy"`` and Task 3 uses
+``pytest -m "azure or policy"``. Helper adversarial tests can be isolated with
+``pytest -m selftest``.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +32,17 @@ AZURE_PIPELINES = {
     "example": Path("examples/azure-pipelines.yml"),
 }
 EXPECTED_YAML = (*GITHUB_WORKFLOWS.values(), *AZURE_PIPELINES.values())
+PARAMETER_EXPRESSION = re.compile(
+    r"\$\{\{\s*(?P<scope>inputs|parameters)\s*"
+    r"(?:\.\s*(?P<dot>[A-Za-z_][\w-]*)|"
+    r"\[\s*['\"](?P<bracket>[^'\"]+)['\"]\s*\])\s*\}\}",
+    re.IGNORECASE,
+)
+PATH_VARIABLE = re.compile(
+    r"\$(?:(?:env:)?(?:WORKING_DIRECTORY|TEST_PATH)|"
+    r"\{(?:WORKING_DIRECTORY|TEST_PATH)\})",
+    re.IGNORECASE,
+)
 
 
 class GithubYamlLoader(yaml.SafeLoader):
@@ -90,6 +107,83 @@ def mapping_at(document: Mapping[str, Any], key: str, source: Path) -> Mapping[s
     value = document.get(key)
     assert isinstance(value, Mapping), f"{source.as_posix()}: '{key}' must be a mapping"
     return value
+
+
+def scalar_text(document: Any) -> str:
+    return "\n".join(value for _trail, value in walk(document) if isinstance(value, str))
+
+
+def expressions(document: Any) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    for _trail, value in walk(document):
+        if not isinstance(value, str):
+            continue
+        for match in PARAMETER_EXPRESSION.finditer(value):
+            found.append((match.group("scope").lower(), match.group("dot") or match.group("bracket")))
+    return found
+
+
+def wired_expression_names(
+    document: Any, scope: str, allowed_containers: set[str]
+) -> set[str]:
+    """Return expressions wired through executable configuration, not labels/comments."""
+    names: set[str] = set()
+    for trail, value in walk(document):
+        if not isinstance(value, str) or not allowed_containers.intersection(trail):
+            continue
+        for match in PARAMETER_EXPRESSION.finditer(value):
+            if match.group("scope").lower() == scope.lower():
+                names.add(match.group("dot") or match.group("bracket"))
+    return names
+
+
+def occurrence_is_quoted(line: str, start: int) -> bool:
+    """Return whether a shell variable occurrence is inside single/double quotes."""
+    prefix = line[:start]
+    single_open = len(re.findall(r"(?<!\\)'", prefix)) % 2 == 1
+    double_open = len(re.findall(r'(?<!\\)"', prefix)) % 2 == 1
+    return single_open or double_open
+
+
+def has_canonical_containment(command_text: str, path_name: str) -> bool:
+    """Require path canonicalization followed by a checkout-boundary comparison."""
+    shell_name = path_name.replace("-", "_").upper()
+    canonical = re.search(
+        rf"(?:realpath|Resolve-Path|GetFullPath)[^\r\n]*{re.escape(shell_name)}",
+        command_text,
+        re.IGNORECASE,
+    )
+    if canonical is None:
+        return False
+    containment = re.search(
+        r"(?:"
+        r"case\b[\s\S]{0,400}(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)[\s\S]{0,120}/\*|"
+        r"(?:==|!=)[^\r\n]*(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)[^\r\n]*/\*|"
+        r"(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)[\s\S]{0,500}\.StartsWith\s*\(|"
+        r"\.StartsWith\s*\([^\r\n]*(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)"
+        r")",
+        command_text[canonical.end() :],
+        re.IGNORECASE,
+    )
+    return containment is not None
+
+
+def assert_named_checks(document: Mapping[str, Any], source: Path) -> str:
+    jobs = mapping_at(document, "jobs", source)
+    names: list[str] = []
+    for job_key, job in jobs.items():
+        assert isinstance(job, Mapping), f"{source.as_posix()}: job {job_key!r} must be a mapping"
+        assert str(job.get("name", "")).strip(), f"{source.as_posix()}: job {job_key!r} needs a name"
+        names.append(str(job["name"]))
+        steps = job.get("steps", [])
+        if isinstance(steps, list):
+            for index, step in enumerate(steps):
+                if isinstance(step, Mapping) and ("run" in step or "uses" in step):
+                    assert str(step.get("name", "")).strip(), (
+                        f"{source.as_posix()}: {job_key}.steps[{index}] needs a name"
+                    )
+                    names.append(str(step["name"]))
+    return "\n".join(names)
 
 
 def assert_contents_read(document: Mapping[str, Any], source: Path) -> None:
@@ -161,11 +255,19 @@ def run_blocks(document: Any) -> Iterator[tuple[tuple[str, ...], str, str]]:
                 yield (*trail, "inputs", "script"), "pwsh", inputs["script"]
 
 
-@pytest.mark.parametrize("relative_path", EXPECTED_YAML, ids=lambda path: path.as_posix())
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        *(pytest.param(path, marks=pytest.mark.github) for path in GITHUB_WORKFLOWS.values()),
+        *(pytest.param(path, marks=pytest.mark.azure) for path in AZURE_PIPELINES.values()),
+    ],
+    ids=lambda path: path.as_posix(),
+)
 def test_required_pipeline_file_exists_and_parses(relative_path: Path) -> None:
     load_yaml(relative_path)
 
 
+@pytest.mark.policy
 def test_every_repository_yaml_parses_as_a_mapping() -> None:
     paths = yaml_paths()
     assert paths, "The repository must contain pipeline YAML files"
@@ -179,6 +281,7 @@ def test_every_repository_yaml_parses_as_a_mapping() -> None:
     assert not errors, "YAML parse/shape errors:\n" + "\n".join(errors)
 
 
+@pytest.mark.github
 @pytest.mark.parametrize(
     ("name", "expected_inputs"),
     [
@@ -202,8 +305,14 @@ def test_reusable_github_workflow_contract(name: str, expected_inputs: set[str])
     )
     assert_input_contract(workflow_call, source, expected_inputs)
     assert mapping_at(workflow, "jobs", source), f"{source.as_posix()}: jobs cannot be empty"
+    used_inputs = wired_expression_names(workflow, "inputs", {"env", "with"})
+    assert expected_inputs <= used_inputs, (
+        f"{source.as_posix()}: declared inputs are not actually used: "
+        f"{sorted(expected_inputs - used_inputs)}"
+    )
 
 
+@pytest.mark.github
 def test_repository_validation_workflow_contract() -> None:
     source = GITHUB_WORKFLOWS["repository"]
     workflow = load_yaml(source)
@@ -227,8 +336,82 @@ def test_repository_validation_workflow_contract() -> None:
         f"{source.as_posix()}: validation jobs must call all reusable workflows; "
         f"missing {sorted(expected - referenced)}"
     )
+    expected_with = {
+        "./.github/workflows/reusable-terraform.yml": {
+            "working-directory",
+            "terraform-version",
+        },
+        "./.github/workflows/reusable-powershell.yml": {
+            "working-directory",
+            "powershell-version",
+            "test-path",
+        },
+        "./.github/workflows/reusable-python.yml": {
+            "working-directory",
+            "python-version",
+            "test-path",
+        },
+    }
+    for job_key, job in jobs.items():
+        if not isinstance(job, Mapping) or str(job.get("uses")) not in expected_with:
+            continue
+        supplied = job.get("with")
+        assert isinstance(supplied, Mapping), f"{source.as_posix()}: job {job_key} needs with inputs"
+        assert set(supplied) == expected_with[str(job["uses"])], (
+            f"{source.as_posix()}: job {job_key} must pass exactly "
+            f"{sorted(expected_with[str(job['uses'])])}"
+        )
 
 
+@pytest.mark.github
+@pytest.mark.parametrize(
+    ("name", "command_patterns", "check_name_patterns"),
+    [
+        (
+            "terraform",
+            [
+                r"\bterraform\s+fmt\b[^\r\n]*(?:-check|--check)",
+                r"\bterraform\s+init\b[^\r\n]*-backend=false",
+                r"\bterraform\s+validate\b",
+                r"\btflint\b",
+            ],
+            [r"format", r"init", r"lint", r"validate"],
+        ),
+        (
+            "powershell",
+            [
+                r"Language\.Parser\]::ParseFile|Parser\]::ParseFile",
+                r"\bTest-ModuleManifest\b",
+                r"\bInvoke-ScriptAnalyzer\b",
+                r"\bInvoke-Pester\b",
+            ],
+            [r"pars", r"manifest", r"analy|lint", r"pester|test"],
+        ),
+        (
+            "python",
+            [r"\bruff\s+format\b[^\r\n]*--check", r"\bruff\s+check\b", r"\bpytest\b"],
+            [r"format", r"lint|ruff", r"test|pytest"],
+        ),
+    ],
+)
+def test_reusable_workflows_execute_required_validation_phases(
+    name: str, command_patterns: list[str], check_name_patterns: list[str]
+) -> None:
+    source = GITHUB_WORKFLOWS[name]
+    workflow = load_yaml(source)
+    command_corpus = "\n".join(command for _trail, _shell, command in run_blocks(workflow))
+    check_names = assert_named_checks(workflow, source)
+    for pattern in command_patterns:
+        assert re.search(pattern, command_corpus, re.IGNORECASE), (
+            f"{source.as_posix()}: no validation command matches {pattern!r}"
+        )
+    for pattern in check_name_patterns:
+        assert re.search(pattern, check_names, re.IGNORECASE), (
+            f"{source.as_posix()}: no named check identifies phase {pattern!r}"
+        )
+
+
+@pytest.mark.azure
 @pytest.mark.parametrize(
     ("name", "expected_parameters"),
     [
@@ -261,8 +444,57 @@ def test_azure_template_parameter_contract(name: str, expected_parameters: set[s
     assert any(key in template for key in ("stages", "jobs", "steps")), (
         f"{source.as_posix()}: template must expose stages, jobs, or steps"
     )
+    used_parameters = wired_expression_names(template, "parameters", {"env", "inputs"})
+    assert expected_parameters <= used_parameters, (
+        f"{source.as_posix()}: declared parameters are not actually used: "
+        f"{sorted(expected_parameters - used_parameters)}"
+    )
 
 
+@pytest.mark.azure
+@pytest.mark.parametrize(
+    ("name", "patterns"),
+    [
+        (
+            "terraform",
+            [
+                r"\bterraform\s+fmt\b[^\r\n]*(?:-check|--check)",
+                r"\bterraform\s+init\b[^\r\n]*-backend=false",
+                r"\bterraform\s+validate\b",
+                r"\btflint\b",
+            ],
+        ),
+        (
+            "powershell",
+            [
+                r"Parser\]::ParseFile",
+                r"\bTest-ModuleManifest\b",
+                r"\bInvoke-ScriptAnalyzer\b",
+                r"\bInvoke-Pester\b",
+            ],
+        ),
+        ("python", [r"\bruff\s+format\b[^\r\n]*--check", r"\bruff\s+check\b", r"\bpytest\b"]),
+    ],
+)
+def test_azure_templates_execute_required_validation_phases(
+    name: str, patterns: list[str]
+) -> None:
+    source = AZURE_PIPELINES[name]
+    template = load_yaml(source)
+    commands = "\n".join(command for _trail, _shell, command in run_blocks(template))
+    display_names = "\n".join(
+        str(value)
+        for trail, value in walk(template)
+        if trail and trail[-1].lower() == "displayname"
+    )
+    assert display_names.strip(), f"{source.as_posix()}: validation steps need displayName values"
+    for pattern in patterns:
+        assert re.search(pattern, commands, re.IGNORECASE), (
+            f"{source.as_posix()}: no validation command matches {pattern!r}"
+        )
+
+
+@pytest.mark.azure
 def test_azure_example_imports_all_validation_templates() -> None:
     source = AZURE_PIPELINES["example"]
     example = load_yaml(source)
@@ -277,16 +509,37 @@ def test_azure_example_imports_all_validation_templates() -> None:
         )
 
 
+@pytest.mark.policy
 def test_all_yaml_is_validation_only_and_has_no_credentials() -> None:
-    forbidden_key = re.compile(
-        r"(?:secret|credential|id-token|oidc|service.?connection|"
-        r"connectedServiceNameARM|client.?secret|access.?key|subscription)",
-        re.IGNORECASE,
-    )
+    forbidden_keys = {
+        "secrets",
+        "credential",
+        "credentials",
+        "idtoken",
+        "oidc",
+        "serviceconnection",
+        "connectedservicenamearm",
+        "clientsecret",
+        "accesskey",
+        "awsaccesskeyid",
+        "awssecretaccesskey",
+        "azuresubscription",
+    }
     forbidden_text = re.compile(
         r"(?:terraform\s+apply\b|azure/login|configure-aws-credentials|"
         r"az\s+(?:deployment|webapp\s+deploy)\b|aws\s+cloudformation\s+deploy\b|"
-        r"kubectl\s+(?:apply|create|delete)\b|\bdeploy(?:ment)?\s+(?:job|stage)\b)",
+        r"kubectl\s+(?:apply|create|delete)\b|helm\s+(?:install|upgrade|uninstall)\b|"
+        r"\bdeploy(?:ment)?\s+(?:job|stage)\b)",
+        re.IGNORECASE,
+    )
+    deployment_action = re.compile(
+        r"(?:azure/(?:webapps-deploy|functions-action)|actions/deploy-pages|"
+        r"amazon-ecs-deploy-task-definition|google-github-actions/deploy)",
+        re.IGNORECASE,
+    )
+    deployment_task = re.compile(
+        r"(?:AzureResourceManagerTemplateDeployment|AzureWebApp|KubernetesManifest|"
+        r"Docker|HelmDeploy|AzureFunctionApp)@",
         re.IGNORECASE,
     )
     violations: list[str] = []
@@ -295,12 +548,17 @@ def test_all_yaml_is_validation_only_and_has_no_credentials() -> None:
         document = load_yaml(relative)
         for trail, value in walk(document):
             location = ".".join(trail) or "<root>"
-            if trail and forbidden_key.search(trail[-1]):
+            key = re.sub(r"[^a-z0-9]", "", trail[-1].lower()) if trail else ""
+            if key in forbidden_keys:
                 violations.append(f"{relative.as_posix()}:{location} uses a credential field")
-            if trail and trail[-1].lower() in {"deployment", "deployments"}:
-                violations.append(f"{relative.as_posix()}:{location} defines a deployment")
-            if isinstance(value, str) and value.lower() == "write":
-                violations.append(f"{relative.as_posix()}:{location} grants write permission")
+            if key in {"environment", "environments", "deployment", "deployments"}:
+                violations.append(f"{relative.as_posix()}:{location} defines a deployment target")
+            if (
+                len(trail) >= 2
+                and trail[-2].lower() in {"jobs", "stages"}
+                and re.search(r"deploy", trail[-1], re.IGNORECASE)
+            ):
+                violations.append(f"{relative.as_posix()}:{location} defines a deployment job/stage")
             if (
                 trail
                 and trail[-1].lower() in {"job", "stage"}
@@ -310,9 +568,17 @@ def test_all_yaml_is_validation_only_and_has_no_credentials() -> None:
                 violations.append(f"{relative.as_posix()}:{location} names a deployment job/stage")
             if isinstance(value, str) and forbidden_text.search(value):
                 violations.append(f"{relative.as_posix()}:{location} contains a deployment command")
+            if trail and trail[-1].lower() == "uses" and isinstance(value, str):
+                if deployment_action.search(value):
+                    violations.append(f"{relative.as_posix()}:{location} invokes deployment action")
+            if trail and trail[-1].lower() == "task" and isinstance(value, str):
+                if deployment_task.search(value):
+                    violations.append(f"{relative.as_posix()}:{location} invokes deployment task")
     assert not violations, "Validation-only policy violations:\n" + "\n".join(violations)
 
 
+@pytest.mark.github
+@pytest.mark.policy
 def test_github_workflows_never_grant_write_permissions() -> None:
     violations: list[str] = []
     for path in sorted((REPOSITORY_ROOT / ".github/workflows").glob("*.y*ml")):
@@ -320,22 +586,30 @@ def test_github_workflows_never_grant_write_permissions() -> None:
         workflow = load_yaml(relative)
         assert_contents_read(workflow, relative)
         for trail, value in walk(workflow):
-            if trail and trail[-1] == "permissions" and value != {"contents": "read"}:
-                violations.append(f"{relative.as_posix()}:{'.'.join(trail)} = {value!r}")
-            if isinstance(value, str) and value.lower() == "write":
-                violations.append(f"{relative.as_posix()}:{'.'.join(trail)} grants write")
+            if not trail or trail[-1] != "permissions":
+                continue
+            if not isinstance(value, Mapping):
+                violations.append(
+                    f"{relative.as_posix()}:{'.'.join(trail)} must be a permissions mapping"
+                )
+                continue
+            for permission, access in value.items():
+                if str(access).lower() in {"write", "write-all"}:
+                    violations.append(
+                        f"{relative.as_posix()}:{'.'.join(trail)}.{permission} grants {access}"
+                    )
     assert not violations, "Write permission grants are forbidden:\n" + "\n".join(violations)
 
 
+@pytest.mark.policy
 def test_shell_blocks_are_strict_and_do_not_interpolate_parameters() -> None:
     violations: list[str] = []
-    interpolation = re.compile(r"\$\{\{\s*(?:inputs|parameters)\.", re.IGNORECASE)
     for path in yaml_paths():
         relative = path.relative_to(REPOSITORY_ROOT)
         document = load_yaml(relative)
         for trail, shell, command in run_blocks(document):
             location = f"{relative.as_posix()}:{'.'.join(trail)}"
-            if interpolation.search(command):
+            if PARAMETER_EXPRESSION.search(command):
                 violations.append(f"{location} directly interpolates an untrusted parameter")
             if shell.startswith("bash") or re.search(r"(^|/)bash\b", shell):
                 if not re.search(r"(?m)^\s*set -euo pipefail\s*$", command):
@@ -351,50 +625,47 @@ def test_shell_blocks_are_strict_and_do_not_interpolate_parameters() -> None:
     assert not violations, "Unsafe shell blocks:\n" + "\n".join(violations)
 
 
+@pytest.mark.policy
 def test_path_parameters_are_passed_via_environment_and_quoted() -> None:
     violations: list[str] = []
-    path_variable = re.compile(
-        r"\$(?:(?:env:)?(?:WORKING_DIRECTORY|TEST_PATH)|"
-        r"\{(?:WORKING_DIRECTORY|TEST_PATH)\})",
-        re.IGNORECASE,
-    )
-    quoted_path = re.compile(
-        r"(?:['\"]\$(?:(?:env:)?(?:WORKING_DIRECTORY|TEST_PATH)|"
-        r"\{(?:WORKING_DIRECTORY|TEST_PATH)\})['\"]|"
-        r"Join-Path\s+[^\r\n]*(?:WORKING_DIRECTORY|TEST_PATH))",
-        re.IGNORECASE,
-    )
     for path in yaml_paths():
         relative = path.relative_to(REPOSITORY_ROOT)
         document = load_yaml(relative)
         commands: list[str] = []
         for trail, _shell, command in run_blocks(document):
             commands.append(command)
-            if path_variable.search(command) and not quoted_path.search(command):
-                violations.append(
-                    f"{relative.as_posix()}:{'.'.join(trail)} uses an unquoted path variable"
-                )
-        if relative in {
-            GITHUB_WORKFLOWS["terraform"],
-            GITHUB_WORKFLOWS["powershell"],
-            GITHUB_WORKFLOWS["python"],
-            AZURE_PIPELINES["terraform"],
-            AZURE_PIPELINES["powershell"],
-            AZURE_PIPELINES["python"],
-        }:
+            for line_number, line in enumerate(command.splitlines(), start=1):
+                for match in PATH_VARIABLE.finditer(line):
+                    if not occurrence_is_quoted(line, match.start()):
+                        violations.append(
+                            f"{relative.as_posix()}:{'.'.join(trail)}:{line_number} "
+                            f"uses unquoted {match.group(0)!r}"
+                        )
+        required_paths = {
+            GITHUB_WORKFLOWS["terraform"]: {"working-directory"},
+            GITHUB_WORKFLOWS["powershell"]: {"working-directory", "test-path"},
+            GITHUB_WORKFLOWS["python"]: {"working-directory", "test-path"},
+            AZURE_PIPELINES["terraform"]: {"working-directory"},
+            AZURE_PIPELINES["powershell"]: {"working-directory", "test-path"},
+            AZURE_PIPELINES["python"]: {"working-directory", "test-path"},
+        }.get(relative, set())
+        if required_paths:
             command_text = "\n".join(commands)
-            if not re.search(r"(?:realpath|Resolve-Path|GetFullPath)", command_text, re.IGNORECASE):
-                violations.append(f"{relative.as_posix()} does not canonicalize path parameters")
-            if not re.search(
-                r"(?:GITHUB_WORKSPACE|BUILD_SOURCESDIRECTORY)", command_text, re.IGNORECASE
-            ):
-                violations.append(f"{relative.as_posix()} does not constrain paths to the checkout")
+            for path_name in required_paths:
+                if not has_canonical_containment(command_text, path_name):
+                    violations.append(
+                        f"{relative.as_posix()} must canonicalize {path_name}, then enforce "
+                        "a checkout-root prefix boundary"
+                    )
         for trail, value in walk(document):
             if (
                 trail
                 and trail[-1] == "working-directory"
                 and isinstance(value, str)
-                and re.search(r"\$\{\{\s*inputs\.working-directory", value, re.IGNORECASE)
+                and any(
+                    scope == "inputs" and name.lower() == "working-directory"
+                    for scope, name in expressions({"value": value})
+                )
             ):
                 violations.append(
                     f"{relative.as_posix()}:{'.'.join(trail)} uses an unvalidated path directly"
@@ -402,7 +673,73 @@ def test_path_parameters_are_passed_via_environment_and_quoted() -> None:
     assert not violations, "Unsafe path handling:\n" + "\n".join(violations)
 
 
+@pytest.mark.selftest
 def test_github_yaml_loader_preserves_on_as_a_string_key() -> None:
     parsed = yaml.load("on:\n  workflow_call:\npermissions:\n  contents: read\n", Loader=GithubYamlLoader)
     assert "on" in parsed
     assert True not in parsed
+
+
+@pytest.mark.selftest
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("${{ inputs.working-directory }}", [("inputs", "working-directory")]),
+        ("${{ inputs['test-path'] }}", [("inputs", "test-path")]),
+        ('${{ inputs["python-version"] }}', [("inputs", "python-version")]),
+        ("${{ parameters.workingDirectory }}", [("parameters", "workingDirectory")]),
+        ("${{ parameters ['testPath'] }}", [("parameters", "testPath")]),
+    ],
+)
+def test_parameter_expression_parser_handles_dot_and_bracket_syntax(
+    value: str, expected: list[tuple[str, str]]
+) -> None:
+    assert expressions({"value": value}) == expected
+
+
+@pytest.mark.selftest
+def test_input_usage_must_be_wired_not_merely_mentioned() -> None:
+    document = {
+        "name": "${{ inputs.working-directory }}",
+        "jobs": {
+            "validate": {
+                "steps": [
+                    {
+                        "env": {"TEST_PATH": "${{ inputs['test-path'] }}"},
+                        "run": 'pytest "$TEST_PATH"',
+                    }
+                ]
+            }
+        },
+    }
+    assert wired_expression_names(document, "inputs", {"env", "with"}) == {"test-path"}
+
+
+@pytest.mark.selftest
+def test_each_path_variable_occurrence_must_be_quoted() -> None:
+    safe = 'realpath -- "$WORKING_DIRECTORY" "$TEST_PATH"'
+    unsafe = 'realpath -- $WORKING_DIRECTORY "$TEST_PATH"'
+    assert all(occurrence_is_quoted(safe, match.start()) for match in PATH_VARIABLE.finditer(safe))
+    assert not all(
+        occurrence_is_quoted(unsafe, match.start()) for match in PATH_VARIABLE.finditer(unsafe)
+    )
+
+
+@pytest.mark.selftest
+def test_containment_requires_canonicalization_before_boundary_check() -> None:
+    safe = """safe_path="$(realpath -- "$WORKING_DIRECTORY")"
+case "$safe_path" in
+  "$GITHUB_WORKSPACE"/*) ;;
+  *) exit 2 ;;
+esac
+"""
+    keyword_only = 'realpath "$WORKING_DIRECTORY"\necho "$GITHUB_WORKSPACE"'
+    reversed_order = """case "$WORKING_DIRECTORY" in
+  "$GITHUB_WORKSPACE"/*) ;;
+esac
+safe_path="$(realpath -- "$WORKING_DIRECTORY")"
+"""
+    assert has_canonical_containment(safe, "working-directory")
+    assert not has_canonical_containment(safe, "test-path")
+    assert not has_canonical_containment(keyword_only, "working-directory")
+    assert not has_canonical_containment(reversed_order, "working-directory")
